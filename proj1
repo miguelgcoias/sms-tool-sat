@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+
+import fileinput
+from itertools import combinations, permutations
+
+from pysat.examples.rc2 import RC2
+from pysat.formula import WCNF, IDPool
+
+if __name__ == '__main__':
+    form = WCNF()
+    varpool = IDPool()
+
+    # Function for ID allocation
+    getID = lambda obj: varpool.id(obj)
+
+    # Read input from stdin
+    with fileinput.input() as sms:
+        # Number of tasks, parameters and dependencies
+        n = int(sms.readline().strip('\n'))
+        pars = dict.fromkeys(range(1, n + 1))
+        deps = dict.fromkeys(range(1, n + 1))
+
+        for l in range(1, n + 1):
+            # Current task info
+            task = list(map(int, sms.readline().split()))
+
+            # Format: (r, p, d, k, list of fragments)
+            pars[l] = tuple(task[:4] + [task[4:]])
+        
+        for l in range(1, n + 1):
+            # Ignore first digit, correspondent to the number of dependencies
+            deps[l] = list(map(int, sms.readline().split()[1:]))
+
+    # Timing functions
+    est = lambda l, i: pars[l][0] + sum(pars[l][4][:i - 1])
+    ect = lambda l, i: pars[l][0] + sum(pars[l][4][:i])
+    lst = lambda l, i: pars[l][2] - sum(pars[l][4][i - 1:])
+    lct = lambda l, i: pars[l][2] - sum(pars[l][4][i:])
+
+    # Fragment generating function
+    domain = lambda: ((l, i)
+        for l in range(1, n + 1)
+        for i in range(1, pars[l][3] + 1))
+
+    # Other helper functions
+    proc_t = lambda l, i: pars[l][4][i - 1]
+    s = lambda l, i, k, j, t: lst(k, j) + 1 if (t + proc_t(l, i) > lst(k, j)) \
+        else (est(k, j) if t + proc_t(l, i) < est(k, j) \
+        else t + proc_t(l, i))
+
+    # Clause sets
+    C1 = [[getID(('sa', l, i, est(l, i)))] 
+        for (l, i) in domain()]
+    C2 = [[getID(('pr', l, i, l, i + 1))]
+        for (l, i) in domain()
+        if i < pars[l][3]]
+    C3 = [[getID(('pr', l, i, k, j)), getID(('pr', k, j, l, i))]
+        for ((l, i), (k, j)) in combinations(domain(), 2)
+        if (k != l
+        and k not in deps[l]
+        and l not in deps[k]
+        and est(k, j) < lct(l, i))
+        and est(l, i) < lct(k, j)]
+    C4 = [[getID(('pr', k, pars[k][3], l, 1))]
+        for l in range(1, n + 1)
+        for k in deps[l]] + \
+        [[getID(('eb', k, pars[k][3], pars[k][2])), getID(('sa', l, 1, lst(l, 1) + 1))]
+        for l in range(1, n + 1)
+        for k in deps[l]]
+    C5 = [[-getID(('eb', l, pars[l][3], pars[l][2])), getID(('eb', l, i, lct(l, i)))] 
+        for (l, i) in domain()]
+    C6 = [[-getID(('sa', l, i, t)), getID(('sa', l, i, t - 1))]
+        for (l, i) in domain()
+        for t in range(est(l, i) + 1, lst(l, i) + 2)]
+    C7 = [[-getID(('eb', l, i, t)), getID(('eb', l, i, t + 1))]
+        for (l, i) in domain()
+        for t in range(ect(l, i) - 1, lct(l, i))]
+    C8 = [[-getID(('sa', l, i, t)), -getID(('eb', l, i, t + proc_t(l, i) - 1))]
+        for (l, i) in domain()
+        for t in range(est(l, i), lst(l, i) + 2)]
+    C9 = [[-getID(('sa', l, i, t)), -getID(('pr', l, i, k, j)),
+        getID(('sa', k, j, s(l, i, k, j, t)))]
+        for ((l, i), (k, j)) in permutations(domain(), 2)
+        for t in range(est(l, i), lst(l, i) + 2)]
+
+    # Soft clause set
+    O = [[getID(('eb', l, pars[l][3], pars[l][2]))]
+        for l in range(1, n + 1)]
+
+    # Final formulation
+    form.extend(C1 + C2 + C3 + C4 + C5 + C6 + C7 + C8 + C9)
+    form.extend(O, weights=[1 for _ in range(n)])
+
+    # Get an answer
+    with RC2(form) as rc2:
+        model = rc2.compute()
+
+    # Auxiliary variables
+    schedule = {task: [None for _ in range(pars[task][3])]
+        for task in range(1, n + 1)}
+    scheduled = []
+    objectives = [('eb', l, pars[l][3], pars[l][2])
+        for l in range(1, n + 1)]
+
+    # Extract answer information
+    for lit in objectives:
+        # If a variable is not satisfied, not all tasks were completed
+        if model[getID(lit) - 1] > 0:
+            scheduled.append(lit[1])
+
+    possibilities = [('sa', l, i, t)
+        for l in scheduled
+        for i in range(1, pars[l][3] + 1)
+        for t in range(est(l, i), lst(l, i) + 2)]
+
+    # Find proposed schedule
+    for lit in possibilities:
+        if model[getID(lit) - 1] > 0:
+            if schedule[lit[1]][lit[2] - 1] is not None:
+                schedule[lit[1]][lit[2] - 1] = max(schedule[lit[1]][lit[2] - 1],
+                    lit[3])
+            else:
+                schedule[lit[1]][lit[2] - 1] = lit[3]
+
+    # Generate output strings
+    output = f'{len(scheduled)}\n'
+    for task, times in schedule.items():
+        # Lazily checking if task was not scheduled
+        if times[0] is not None:
+            times_clean = str(times).replace('[', '').replace(']', '').replace(',', '') 
+            output += f'{task} {times_clean} \n'
+
+    # Prints output to stdout
+    print(output, end='')
